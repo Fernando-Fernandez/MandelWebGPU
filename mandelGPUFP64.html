@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Mandelbrot WebGPU FP64</title>
+<style>
+  body { margin: 0; }
+  canvas { position:absolute; left:0; top:0; display:block; }
+  #glcanvas { width:100vw; height:100vh; z-index:0; }
+  #overlay  { width:100vw; height:100vh; z-index:1; }
+</style>
+</head>
+<body>
+
+<canvas id="glcanvas"></canvas>
+<canvas id="overlay"></canvas>
+
+<script type="module">
+// ---------- WGSL shaders ----------
+
+const computeShaderWGSL = /* wgsl */`
+enable f64;
+
+struct Params {
+    center      : vec2<f64>,
+    zoom        : vec2<f64>,
+    resolution  : vec2<f64>,
+    aspect      : f64,
+    maxIter     : f64,
+    colorScale  : f64,
+    smoothColor : f64,
+};
+
+@group(0) @binding(0) var outImage : texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(1) var<uniform> params : Params;
+
+const MAX_ITER : i32 = 2000;
+const PALETTE_SIZE : f32 = 14.0;
+
+fn palette(idx : f32) -> vec3<f32> {
+    let i = idx - PALETTE_SIZE * floor(idx / PALETTE_SIZE);
+
+    if (i < 1.0)  { return vec3<f32>(0.5,0.5,0.5); }   // gray
+    if (i < 2.0)  { return vec3<f32>(0.0,0.0,0.0); }   // black
+    if (i < 3.0)  { return vec3<f32>(0.6,0.4,0.2); }   // brown
+    if (i < 4.0)  { return vec3<f32>(1.0,0.0,0.0); }   // red
+    if (i < 5.0)  { return vec3<f32>(1.0,0.5,0.0); }   // orange
+    if (i < 6.0)  { return vec3<f32>(1.0,1.0,0.0); }   // yellow
+    if (i < 7.0)  { return vec3<f32>(0.0,1.0,0.0); }   // green
+    if (i < 8.0)  { return vec3<f32>(0.5,1.0,0.83); }  // aquamarine
+    if (i < 9.0)  { return vec3<f32>(0.0,1.0,1.0); }   // cyan
+    if (i < 10.0) { return vec3<f32>(0.0,0.0,1.0); }   // blue
+    if (i < 11.0) { return vec3<f32>(0.0,0.0,0.5); }   // navy
+    if (i < 12.0) { return vec3<f32>(0.5,0.0,0.5); }   // purple
+    if (i < 13.0) { return vec3<f32>(1.0,0.0,1.0); }   // magenta
+    return vec3<f32>(1.0,1.0,1.0);                     // white
+}
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+    let width  : u32 = u32(params.resolution.x);
+    let height : u32 = u32(params.resolution.y);
+
+    if (gid.x >= width || gid.y >= height) {
+        return;
+    }
+
+    let px : f64 = f64(gid.x);
+    let py : f64 = f64(gid.y);
+    let resX : f64 = params.resolution.x;
+    let resY : f64 = params.resolution.y;
+
+    var uvx : f64 = px / resX - 0.5;
+    var uvy : f64 = py / resY - 0.5;
+
+    uvx = uvx * params.aspect;
+
+    let cx : f64 = uvx * params.zoom.x + params.center.x;
+    let cy : f64 = uvy * params.zoom.y + params.center.y;
+
+    var zx : f64 = 0.0;
+    var zy : f64 = 0.0;
+    var escaped : bool = false;
+    var i : i32 = 0;
+
+    loop {
+        if (i >= MAX_ITER) { break; }
+        if (f64(i) >= params.maxIter) { break; }
+
+        let x2 : f64 = zx*zx - zy*zy + cx;
+        let y2 : f64 = 2.0*zx*zy + cy;
+        zx = x2;
+        zy = y2;
+
+        if (zx*zx + zy*zy > 4.0) {
+            escaped = true;
+            break;
+        }
+        i = i + 1;
+    }
+
+    var color : vec3<f32>;
+
+    if (!escaped) {
+        color = vec3<f32>(0.0, 0.0, 0.0);
+    } else {
+        var val : f64 = f64(i);
+
+        if (params.smoothColor > 0.5) {
+            let mag : f64 = zx*zx + zy*zy;
+            if (mag > 0.0) {
+                val = val + 1.0 - log(log(mag)) / log(2.0);
+            }
+        }
+
+        let scaled : f32 = f32(val * params.colorScale);
+        color = palette(scaled);
+    }
+
+    textureStore(outImage, vec2<i32>(i32(gid.x), i32(gid.y)),
+                 vec4<f32>(color, 1.0));
+}
+`;
+
+const renderShaderWGSL = /* wgsl */`
+@group(0) @binding(0) var mySampler : sampler;
+@group(0) @binding(1) var myTex : texture_2d<f32>;
+
+struct VSOut {
+    @builtin(position) pos : vec4<f32>,
+    @location(0) uv : vec2<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) vid : u32) -> VSOut {
+    // big triangle covering the screen
+    var pos = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 3.0, -1.0),
+        vec2<f32>(-1.0,  3.0),
+    );
+    var out : VSOut;
+    out.pos = vec4<f32>(pos[vid], 0.0, 1.0);
+    out.uv  = (pos[vid] + vec2<f32>(1.0, 1.0)) * 0.5;
+    return out;
+}
+
+@fragment
+fn fs(in: VSOut) -> @location(0) vec4<f32> {
+    return textureSample(myTex, mySampler, in.uv);
+}
+`;
+
+// ---------- JS / WebGPU setup ----------
+
+async function main() {
+    if (!('gpu' in navigator)) {
+        console.error('WebGPU not supported in this browser.');
+        return;
+    }
+
+    const canvas = document.getElementById('glcanvas');
+    const overlay = document.getElementById('overlay');
+    const ctx2d = overlay.getContext('2d');
+
+    canvas.width = canvas.clientWidth;
+    canvas.height = canvas.clientHeight;
+    overlay.width = canvas.width;
+    overlay.height = canvas.height;
+
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+        console.error('Failed to get GPU adapter.');
+        return;
+    }
+    if (!adapter.features.has('shader-f64')) {
+        console.error('shader-f64 not supported on this adapter.');
+        return;
+    }
+
+    const device = await adapter.requestDevice({
+        requiredFeatures: ['shader-f64']
+    });
+
+    const context = canvas.getContext('webgpu');
+    const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({
+        device,
+        format: canvasFormat,
+        alphaMode: 'premultiplied'
+    });
+
+    const width = canvas.width;
+    const height = canvas.height;
+
+    // Texture that compute shader writes into
+    let fractTexture = device.createTexture({
+        size: { width, height },
+        format: 'rgba8unorm',
+        usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING
+    });
+    let fractView = fractTexture.createView();
+
+    // Uniform buffer for Params (10 f64 values)
+    const paramsBufferSize = 10 * 8; // 10 x f64
+    const paramsBuffer = device.createBuffer({
+        size: paramsBufferSize,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+
+    // Pipelines
+    const computeModule = device.createShaderModule({ code: computeShaderWGSL });
+    const renderModule = device.createShaderModule({ code: renderShaderWGSL });
+
+    const computePipeline = device.createComputePipeline({
+        layout: 'auto',
+        compute: {
+            module: computeModule,
+            entryPoint: 'main'
+        }
+    });
+
+    const renderPipeline = device.createRenderPipeline({
+        layout: 'auto',
+        vertex: {
+            module: renderModule,
+            entryPoint: 'vs'
+        },
+        fragment: {
+            module: renderModule,
+            entryPoint: 'fs',
+            targets: [{ format: canvasFormat }]
+        },
+        primitive: { topology: 'triangle-list' }
+    });
+
+    // Bind groups
+    const computeBindGroup = device.createBindGroup({
+        layout: computePipeline.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: fractView },
+            { binding: 1, resource: { buffer: paramsBuffer } }
+        ]
+    });
+
+    const sampler = device.createSampler({
+        magFilter: 'linear',
+        minFilter: 'linear'
+    });
+
+    const renderBindGroup = device.createBindGroup({
+        layout: renderPipeline.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: sampler },
+            { binding: 1, resource: fractView }
+        ]
+    });
+
+    // Fractal state
+    const fractalAspect = 0.9;
+    const screenAspect = width / height;
+
+    let zoomY = 2.5;
+    let zoomX = zoomY * fractalAspect;
+
+    let currentCenter = { x: -0.375, y: 0.0 };
+    let currentZoom = { x: zoomX, y: zoomY };
+
+    const initialArea = zoomX * zoomY;
+    let currentMaxIter = 50;
+    let smooth = false;
+
+    // Params packed as 10 f64:
+    // [0] center.x, [1] center.y
+    // [2] zoom.x,   [3] zoom.y
+    // [4] resX,     [5] resY
+    // [6] aspect,   [7] maxIter
+    // [8] colorScale,[9] smoothColor
+    const paramsArray = new Float64Array(10);
+
+    function writeParamsAndDraw() {
+        const area = currentZoom.x * currentZoom.y;
+        let colorScale = Math.sqrt(area / initialArea);
+        colorScale = Math.max(colorScale, 0.05);
+
+        paramsArray[0] = currentCenter.x;
+        paramsArray[1] = currentCenter.y;
+        paramsArray[2] = currentZoom.x;
+        paramsArray[3] = currentZoom.y;
+        paramsArray[4] = width;
+        paramsArray[5] = height;
+        paramsArray[6] = screenAspect / fractalAspect;
+        paramsArray[7] = currentMaxIter;
+        paramsArray[8] = colorScale;
+        paramsArray[9] = smooth ? 1.0 : 0.0;
+
+        device.queue.writeBuffer(
+            paramsBuffer,
+            0,
+            paramsArray.buffer,
+            paramsArray.byteOffset,
+            paramsArray.byteLength
+        );
+
+        const commandEncoder = device.createCommandEncoder();
+
+        // Compute pass
+        {
+            const pass = commandEncoder.beginComputePass();
+            pass.setPipeline(computePipeline);
+            pass.setBindGroup(0, computeBindGroup);
+
+            const workgroupSize = 8;
+            const workgroupCountX = Math.ceil(width / workgroupSize);
+            const workgroupCountY = Math.ceil(height / workgroupSize);
+            pass.dispatchWorkgroups(workgroupCountX, workgroupCountY);
+            pass.end();
+        }
+
+        // Render pass
+        {
+            const textureView = context.getCurrentTexture().createView();
+            const pass = commandEncoder.beginRenderPass({
+                colorAttachments: [
+                    {
+                        view: textureView,
+                        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                        loadOp: 'clear',
+                        storeOp: 'store'
+                    }
+                ]
+            });
+
+            pass.setPipeline(renderPipeline);
+            pass.setBindGroup(0, renderBindGroup);
+            pass.draw(3, 1, 0, 0);
+            pass.end();
+        }
+
+        device.queue.submit([commandEncoder.finish()]);
+    }
+
+    writeParamsAndDraw();
+
+    // Keyboard: toggle smooth coloring
+    document.addEventListener('keydown', e => {
+        if (e.key === 's') {
+            smooth = !smooth;
+            writeParamsAndDraw();
+        }
+    });
+
+    // ---------- Rectangle zoom on overlay canvas ----------
+    let dragging = false;
+    let start = { x: 0, y: 0 };
+    let curr = { x: 0, y: 0 };
+
+    overlay.addEventListener('pointerdown', e => {
+        dragging = true;
+        const r = overlay.getBoundingClientRect();
+        start.x = e.clientX - r.left;
+        start.y = e.clientY - r.top;
+        curr = { ...start };
+    });
+
+    overlay.addEventListener('pointermove', e => {
+        if (!dragging) return;
+        const r = overlay.getBoundingClientRect();
+        curr.x = e.clientX - r.left;
+        curr.y = e.clientY - r.top;
+        drawRect();
+    });
+
+    overlay.addEventListener('pointerup', clearRect);
+    overlay.addEventListener('pointerleave', clearRect);
+
+    function drawRect() {
+        ctx2d.clearRect(0, 0, overlay.width, overlay.height);
+        let dx = curr.x - start.x;
+        let dy = curr.y - start.y;
+        if (Math.abs(dx) < 2 && Math.abs(dy) < 2) return;
+
+        const adx = Math.abs(dx);
+        const ady = Math.abs(dy);
+
+        let widthR, heightR;
+        if (adx / Math.max(ady, 1e-6) > fractalAspect) {
+            widthR = dx;
+            heightR = Math.sign(dy || 1) * (adx / fractalAspect);
+        } else {
+            heightR = dy;
+            widthR = Math.sign(dx || 1) * (ady * fractalAspect);
+        }
+
+        let x = start.x;
+        let y = start.y;
+        if (widthR < 0) { x += widthR; widthR = -widthR; }
+        if (heightR < 0) { y += heightR; heightR = -heightR; }
+
+        ctx2d.strokeStyle = 'white';
+        ctx2d.lineWidth = 1;
+        ctx2d.strokeRect(x, y, widthR, heightR);
+    }
+
+    function clearRect() {
+        if (!dragging) return;
+        dragging = false;
+
+        let x1 = start.x, y1 = start.y;
+        let x2 = curr.x, y2 = curr.y;
+        if (x2 < x1) [x1, x2] = [x2, x1];
+        if (y2 < y1) [y1, y2] = [y2, y1];
+
+        ctx2d.clearRect(0, 0, overlay.width, overlay.height);
+        if (x2 - x1 < 4 || y2 - y1 < 4) return;
+
+        applyZoomFromRect(x1, y1, x2, y2);
+    }
+
+    function applyZoomFromRect(x1, y1, x2, y2) {
+        function pixelToComplex(px, py) {
+            const uvx = (px / overlay.width) - 0.5;
+            const uvy = 0.5 - (py / overlay.height);
+            const uvx2 = uvx * (screenAspect / fractalAspect);
+            return {
+                x: uvx2 * currentZoom.x + currentCenter.x,
+                y: uvy  * currentZoom.y + currentCenter.y
+            };
+        }
+
+        const c1 = pixelToComplex(x1, y1);
+        const c2 = pixelToComplex(x2, y2);
+
+        const minX = Math.min(c1.x, c2.x);
+        const maxX = Math.max(c1.x, c2.x);
+        const minY = Math.min(c1.y, c2.y);
+        const maxY = Math.max(c1.y, c2.y);
+
+        currentZoom.x = (maxX - minX);
+        currentZoom.y = (maxY - minY);
+        currentCenter.x = (minX + maxX) / 2;
+        currentCenter.y = (minY + maxY) / 2;
+
+        const area = currentZoom.x * currentZoom.y;
+        const scale = Math.sqrt(initialArea / area);
+        currentMaxIter = Math.min(2000, Math.max(50, Math.floor(50 * scale)));
+
+        writeParamsAndDraw();
+    }
+}
+
+main();
+</script>
+</body>
+</html>
