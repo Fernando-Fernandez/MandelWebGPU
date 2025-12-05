@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Mandelbrot WebGPU</title>
+<style>
+  body { margin: 0; }
+  canvas { position:absolute; left:0; top:0; display:block; }
+  #glcanvas { width:100vw; height:100vh; z-index:0; }
+  #overlay  { width:100vw; height:100vh; z-index:1; }
+</style>
+</head>
+<body>
+
+<canvas id="glcanvas"></canvas>
+<canvas id="overlay"></canvas>
+
+<script type="module">
+async function main() {
+    if (!('gpu' in navigator)) {
+        console.error("WebGPU not supported.");
+        return;
+    }
+
+    const canvas  = document.getElementById("glcanvas");
+    const overlay = document.getElementById("overlay");
+    const ctx2d   = overlay.getContext("2d");
+
+    // Match canvas pixel size to CSS size
+    canvas.width  = canvas.clientWidth;
+    canvas.height = canvas.clientHeight;
+    overlay.width  = canvas.width;
+    overlay.height = canvas.height;
+
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+        console.error("No GPU adapter.");
+        return;
+    }
+    const device = await adapter.requestDevice();
+
+    const context = canvas.getContext("webgpu");
+    const format = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({
+        device,
+        format,
+        alphaMode: "premultiplied"
+    });
+
+    const width  = canvas.width;
+    const height = canvas.height;
+    const screenAspect  = width / height;
+    const fractalAspect = 0.9;
+
+    // ---------- WGSL SHADER ----------
+    const shaderCode = `
+struct Params {
+    center        : vec2<f32>,
+    zoom          : vec2<f32>,
+    resolution    : vec2<f32>,
+    aspect        : f32,
+    maxIter       : f32,
+    colorScale    : f32,
+    smoothColor   : f32,
+    paletteOffset : f32,
+};
+
+@group(0) @binding(0)
+var<uniform> params : Params;
+
+const MAX_ITER     : i32 = 2000;
+const PALETTE_SIZE : f32 = 14.0;
+
+fn palette(idx : f32) -> vec3<f32> {
+    // wrap into [0, PALETTE_SIZE)
+    let i = idx - PALETTE_SIZE * floor(idx / PALETTE_SIZE);
+
+    if (i < 1.0)  { return vec3<f32>(0.5,0.5,0.5); }
+    if (i < 2.0)  { return vec3<f32>(0.0,0.0,0.0); }
+    if (i < 3.0)  { return vec3<f32>(0.6,0.4,0.2); }
+    if (i < 4.0)  { return vec3<f32>(1.0,0.0,0.0); }
+    if (i < 5.0)  { return vec3<f32>(1.0,0.5,0.0); }
+    if (i < 6.0)  { return vec3<f32>(1.0,1.0,0.0); }
+    if (i < 7.0)  { return vec3<f32>(0.0,1.0,0.0); }
+    if (i < 8.0)  { return vec3<f32>(0.5,1.0,0.83); }
+    if (i < 9.0)  { return vec3<f32>(0.0,1.0,1.0); }
+    if (i < 10.0) { return vec3<f32>(0.0,0.0,1.0); }
+    if (i < 11.0) { return vec3<f32>(0.0,0.0,0.5); }
+    if (i < 12.0) { return vec3<f32>(0.5,0.0,0.5); }
+    if (i < 13.0) { return vec3<f32>(1.0,0.0,1.0); }
+    return           vec3<f32>(1.0,1.0,1.0);
+}
+
+struct VSOut {
+    @builtin(position) pos : vec4<f32>,
+};
+
+@vertex
+fn vsMain(@builtin(vertex_index) vid : u32) -> VSOut {
+    // Fullscreen triangle, no vertex buffer
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 3.0, -1.0),
+        vec2<f32>(-1.0,  3.0)
+    );
+    var out : VSOut;
+    let p = positions[vid];
+    out.pos = vec4<f32>(p, 0.0, 1.0);
+    return out;
+}
+
+@fragment
+fn fsMain(@builtin(position) fragCoord : vec4<f32>)
+    -> @location(0) vec4<f32> {
+
+    let fc = fragCoord.xy;
+    var uv = (fc / params.resolution) - vec2<f32>(0.5, 0.5);
+
+    // aspect correction
+    uv.x = uv.x * params.aspect;
+
+    let cx = uv.x * params.zoom.x + params.center.x;
+    let cy = uv.y * params.zoom.y + params.center.y;
+
+    var zx : f32 = 0.0;
+    var zy : f32 = 0.0;
+    var escaped = false;
+    var iter : f32 = 0.0;
+
+    let maxIterI = i32(params.maxIter);
+
+    for (var n : i32 = 0; n < MAX_ITER; n = n + 1) {
+        if (n >= maxIterI) { break; }
+
+        let x2 = zx*zx - zy*zy + cx;
+        let y2 = 2.0*zx*zy + cy;
+        zx = x2;
+        zy = y2;
+
+        if (zx*zx + zy*zy > 4.0) {
+            iter = f32(n);
+            escaped = true;
+            break;
+        }
+        iter = f32(n);
+    }
+
+    if (!escaped) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+
+    var val = iter;
+
+    if (params.smoothColor > 0.5) {
+        let mag = max(zx*zx + zy*zy, 1.0001);
+        val = val + 1.0 - log(log(mag)) / log(2.0);
+    }
+
+    let idx = val * params.colorScale + params.paletteOffset;
+    let col = palette(idx);
+    return vec4<f32>(col, 1.0);
+}
+`;
+
+    const shaderModule = device.createShaderModule({ code: shaderCode });
+
+    // optional: log WGSL errors in detail
+    //shaderModule.compilationInfo().then(info => {
+    //    if (info.messages.length > 0) {
+    //        console.group("WGSL compilation log");
+    //        for (const m of info.messages) {
+    //            console[m.type === "error" ? "error" : "warn"](
+    //                `${m.type} @${m.line}:${m.column} - ${m.message}`
+    //            );
+    //        }
+    //        console.groupEnd();
+    //    }
+    //});
+
+    const pipeline = device.createRenderPipeline({
+        layout: "auto",
+        vertex: {
+            module: shaderModule,
+            entryPoint: "vsMain"
+        },
+        fragment: {
+            module: shaderModule,
+            entryPoint: "fsMain",
+            targets: [{ format }]
+        },
+        primitive: { topology: "triangle-list" }
+    });
+
+    // ---------- UNIFORM BUFFER (Params) ----------
+    // Params as 8 floats (vec2 + vec2 + vec2 + 4 scalars) -> 8 * 4 = 32 bytes
+    // For safety we allocate 48 bytes (multiple of 16).
+    const paramsArray = new Float32Array(12);
+    const paramsBuffer = device.createBuffer({
+        size: paramsArray.byteLength,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+
+    const bindGroup = device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: { buffer: paramsBuffer } }
+        ]
+    });
+
+    // ---------- FRACTAL STATE (same semantics as WebGL version) ----------
+    let zoomY = 2.5;
+    let zoomX = zoomY * fractalAspect;
+    let currentCenter = { x: -0.375, y: 0.0 };
+    let currentZoom   = { x: zoomX,   y: zoomY };
+
+    const initialArea = zoomX * zoomY;
+    let currentMaxIter = 50;
+    let smooth = false;
+
+    const palettePeriod    = 14.0;
+    const paletteCycleRate = 2.0;
+    let paletteOffset      = 0.0;
+    let lastFrameTime      = 0;
+
+    const getAspectCorrection = () =>
+        screenAspect * (currentZoom.y / currentZoom.x);
+
+    function writeParamsToBuffer() {
+        const aspectCorrection = getAspectCorrection();
+        const area = currentZoom.x * currentZoom.y;
+        let colorScale = Math.sqrt(area / initialArea);
+        if (colorScale < 0.05) colorScale = 0.05;
+
+        paramsArray[0] = currentCenter.x;
+        paramsArray[1] = currentCenter.y;
+        paramsArray[2] = currentZoom.x;
+        paramsArray[3] = currentZoom.y;
+        paramsArray[4] = width;
+        paramsArray[5] = height;
+        paramsArray[6] = aspectCorrection;
+        paramsArray[7] = currentMaxIter;
+        paramsArray[8] = colorScale;
+        paramsArray[9] = smooth ? 1.0 : 0.0;
+        paramsArray[10] = paletteOffset;
+        paramsArray[11] = 0.0; // padding
+
+        device.queue.writeBuffer(paramsBuffer, 0, paramsArray);
+    }
+
+    writeParamsToBuffer();
+
+    // ---------- RENDER LOOP ----------
+    function frame(ts) {
+        if (lastFrameTime === 0) lastFrameTime = ts;
+        const dt = (ts - lastFrameTime) / 1000;
+        lastFrameTime = ts;
+
+        paletteOffset = (paletteOffset + dt * paletteCycleRate) % palettePeriod;
+        if (paletteOffset < 0) paletteOffset += palettePeriod;
+
+        writeParamsToBuffer();
+
+        const encoder = device.createCommandEncoder();
+        const textureView = context.getCurrentTexture().createView();
+
+        const pass = encoder.beginRenderPass({
+            colorAttachments: [{
+                view: textureView,
+                loadOp: "clear",
+                storeOp: "store",
+                clearValue: { r: 0, g: 0, b: 0, a: 1 }
+            }]
+        });
+
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, bindGroup);
+        pass.draw(3, 1, 0, 0); // fullscreen triangle
+        pass.end();
+
+        device.queue.submit([encoder.finish()]);
+        requestAnimationFrame(frame);
+    }
+
+    requestAnimationFrame(frame);
+
+    // ---------- KEYBOARD: smooth coloring toggle ----------
+    document.addEventListener("keydown", e => {
+        if (e.key === "s") {
+            smooth = !smooth;
+            writeParamsToBuffer();
+        }
+    });
+
+    // ---------- RECTANGLE ZOOM (overlay canvas) ----------
+    let dragging = false;
+    let start = { x: 0, y: 0 };
+    let curr  = { x: 0, y: 0 };
+
+    overlay.addEventListener("pointerdown", e => {
+        dragging = true;
+        const r = overlay.getBoundingClientRect();
+        start.x = e.clientX - r.left;
+        start.y = e.clientY - r.top;
+        curr = { ...start };
+    });
+
+    overlay.addEventListener("pointermove", e => {
+        if (!dragging) return;
+        const r = overlay.getBoundingClientRect();
+        curr.x = e.clientX - r.left;
+        curr.y = e.clientY - r.top;
+        drawRect();
+    });
+
+    overlay.addEventListener("pointerup", clearRect);
+    overlay.addEventListener("pointerleave", clearRect);
+
+    function drawRect() {
+        ctx2d.clearRect(0, 0, overlay.width, overlay.height);
+        let dx = curr.x - start.x;
+        let dy = curr.y - start.y;
+        if (Math.abs(dx) < 2 && Math.abs(dy) < 2) return;
+
+        const adx = Math.abs(dx);
+        const ady = Math.abs(dy);
+        const targetAspect = currentZoom.x / currentZoom.y;
+
+        let widthR, heightR;
+        if (adx / Math.max(ady, 1e-6) > targetAspect) {
+            widthR  = dx;
+            heightR = Math.sign(dy || 1) * (adx / targetAspect);
+        } else {
+            heightR = dy;
+            widthR  = Math.sign(dx || 1) * (ady * targetAspect);
+        }
+
+        let x = start.x;
+        let y = start.y;
+        if (widthR  < 0) { x += widthR;  widthR  = -widthR; }
+        if (heightR < 0) { y += heightR; heightR = -heightR; }
+
+        ctx2d.strokeStyle = "white";
+        ctx2d.lineWidth = 1;
+        ctx2d.strokeRect(x, y, widthR, heightR);
+    }
+
+    function clearRect() {
+        if (!dragging) return;
+        dragging = false;
+
+        let x1 = start.x, y1 = start.y;
+        let x2 = curr.x,  y2 = curr.y;
+        if (x2 < x1) [x1, x2] = [x2, x1];
+        if (y2 < y1) [y1, y2] = [y2, y1];
+
+        ctx2d.clearRect(0, 0, overlay.width, overlay.height);
+        if (x2 - x1 < 4 || y2 - y1 < 4) return;
+
+        applyZoomFromRect(x1, y1, x2, y2);
+    }
+
+    function applyZoomFromRect(x1, y1, x2, y2) {
+        function pixelToComplex(px, py) {
+            const uvx = (px / overlay.width)  - 0.5;
+            const uvy = (py / overlay.height) - 0.5;
+            const uvx2 = uvx * getAspectCorrection();
+            return {
+                x: uvx2 * currentZoom.x + currentCenter.x,
+                y: uvy  * currentZoom.y + currentCenter.y
+            };
+        }
+
+        const c1 = pixelToComplex(x1, y1);
+        const c2 = pixelToComplex(x2, y2);
+
+        const minX = Math.min(c1.x, c2.x);
+        const maxX = Math.max(c1.x, c2.x);
+        const minY = Math.min(c1.y, c2.y);
+        const maxY = Math.max(c1.y, c2.y);
+
+        currentZoom.x   = maxX - minX;
+        currentZoom.y   = maxY - minY;
+        currentCenter.x = (minX + maxX) / 2;
+        currentCenter.y = (minY + maxY) / 2;
+
+        const area  = currentZoom.x * currentZoom.y;
+        const scale = Math.sqrt(initialArea / area);
+        currentMaxIter = Math.min(2000, Math.max(50, Math.floor(50 * scale)));
+
+        writeParamsToBuffer();
+    }
+}
+
+main();
+</script>
+</body>
+</html>

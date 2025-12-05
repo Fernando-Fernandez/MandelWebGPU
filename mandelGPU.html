@@ -61,21 +61,24 @@ vec3 palette(float idx) {
 }
 
 void main() {
+    // Normalize pixel coordinates and compensate for non-square screen aspect.
     vec2 uv = (gl_FragCoord.xy / u_resolution) - 0.5;
     uv.x *= u_aspect; // Keep the fractal square even when the screen is wide
 
+    // Current complex plane coordinate: c = uv * zoom + center
     vec2 c = vec2(
         uv.x * u_zoom.x + u_center.x,
         uv.y * u_zoom.y + u_center.y
     );
 
-    vec2 z = vec2(0.0);
+    vec2 z = vec2(0.0); // Running z_n term
     float i = 0.0;
     bool escaped = false;
 
     for(int n = 0; n < MAX_ITER; n++) {
         if(n >= u_maxIter) break;
 
+        // Classic Mandelbrot recurrence z = z^2 + c
         z = vec2(
             z.x*z.x - z.y*z.y + c.x,
             2.0*z.x*z.y + c.y
@@ -97,6 +100,7 @@ void main() {
     float val = i;
 
     if(u_smoothColor) {
+        // Apply fractional iteration count for smoother gradients.
         float mag = dot(z,z);
         val = val + 1.0 - log(log(mag)) / log(2.0); // fractional escape
     }
@@ -105,6 +109,7 @@ void main() {
     //    val = log(val + 1.0); // log brightness scale
     //}
 
+    // Cycle through the palette continuously using the animated offset.
     float scaled = val * u_colorScale + u_paletteOffset;
     gl_FragColor = vec4(palette(scaled),1.0);
 }
