@@ -245,8 +245,8 @@ function main() {
     const uColorScale = gl.getUniformLocation(prog, "u_colorScale");
     const uSmoothColor= gl.getUniformLocation(prog, "u_smoothColor");
 
-    const fractalAspect = 0.9;
     const screenAspect = canvas.width / canvas.height;
+    const fractalAspect = 0.9;
 
     let zoomY = 2.5;
     let zoomX = zoomY * fractalAspect;
@@ -257,8 +257,9 @@ function main() {
     let currentMaxIter = 50;
     let smooth = false;
 
-    gl.uniform1f(uAspect, screenAspect / fractalAspect);
     gl.uniform2f(uRes, canvas.width, canvas.height);
+
+    const getAspectCorrection = () => screenAspect * (currentZoom.y / currentZoom.x);
 
     const buffer = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
@@ -270,6 +271,7 @@ function main() {
     gl.enableVertexAttribArray(aPos);
 
     function updateUniformsAndRedraw() {
+        const aspectCorrection = getAspectCorrection();
         const area = currentZoom.x * currentZoom.y;
         let colorScale = Math.sqrt(area / initialArea);
         colorScale = Math.max(colorScale, 0.05);
@@ -279,6 +281,7 @@ function main() {
         const zx = split64(currentZoom.x);
         const zy = split64(currentZoom.y);
 
+        gl.uniform1f(uAspect, aspectCorrection);
         gl.uniform4f(uCenter64, cx.hi, cx.lo, cy.hi, cy.lo);
         gl.uniform4f(uZoom64,   zx.hi, zx.lo, zy.hi, zy.lo);
         gl.uniform1i(uMaxIter, currentMaxIter);
@@ -322,8 +325,6 @@ function main() {
     overlay.addEventListener("pointerup", clearRect);
     overlay.addEventListener("pointerleave", clearRect);
 
-    const fractAspect = 0.9;
-
     function drawRect() {
         ctx.clearRect(0,0,overlay.width,overlay.height);
         let dx = curr.x - start.x;
@@ -332,14 +333,15 @@ function main() {
 
         const adx = Math.abs(dx);
         const ady = Math.abs(dy);
+        const targetAspect = currentZoom.x / currentZoom.y;
 
         let width, height;
-        if(adx / Math.max(ady,1e-6) > fractAspect){
+        if(adx / Math.max(ady,1e-6) > targetAspect){
             width = dx;
-            height = Math.sign(dy||1) * (adx/fractalAspect);
+            height = Math.sign(dy||1) * (adx/targetAspect);
         } else {
             height = dy;
-            width = Math.sign(dx||1) * (ady*fractalAspect);
+            width = Math.sign(dx||1) * (ady*targetAspect);
         }
 
         let x = start.x, y = start.y;
@@ -367,7 +369,7 @@ function main() {
         function pixelToComplex(px,py) {
             const uvx = (px/overlay.width) - 0.5;
             const uvy = 0.5 - (py/overlay.height);
-            const uvx2 = uvx * (screenAspect / fractalAspect);
+            const uvx2 = uvx * getAspectCorrection();
             return {
                 x: uvx2 * currentZoom.x + currentCenter.x,
                 y: uvy  * currentZoom.y + currentCenter.y

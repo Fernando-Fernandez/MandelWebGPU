@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <title>Mandelbrot WebGL</title>
 <style>
+  /* Fullscreen overlayed canvases allow WebGL rendering plus interaction layer */
   body { margin: 0; }
   canvas { position:absolute; left:0; top:0; display:block; }
   #glcanvas { width:100vw; height:100vh; z-index:0; }
@@ -16,12 +17,15 @@
 <canvas id="overlay"></canvas>
 
 <script>
+
+// Fullscreen quad vertex shader; it simply emits clip-space corners.
 const vertexShaderSrc = `
 attribute vec2 a_position;
 void main() {
     gl_Position = vec4(a_position, 0.0, 1.0);
 }`;
 
+// Fragment shader performs the Mandelbrot iteration and colors by escape time.
 const fragmentShaderSrc = `
 precision highp float;
 uniform vec2 u_center;
@@ -31,12 +35,14 @@ uniform float u_aspect;
 uniform int u_maxIter;
 uniform float u_colorScale;
 uniform bool u_smoothColor;   // NEW toggle
+uniform float u_paletteOffset;
 //uniform bool u_logScale;      // NEW toggle
 
 const int MAX_ITER = 2000;
 const float PALETTE_SIZE = 14.0;
 
 vec3 palette(float idx) {
+    // Compact hard-coded palette approximates a classic rainbow gradient.
     float i = mod(idx, PALETTE_SIZE);
     if(i < 1.0) return vec3(0.5,0.5,0.5);
     if(i < 2.0) return vec3(0.0,0.0,0.0);
@@ -56,7 +62,7 @@ vec3 palette(float idx) {
 
 void main() {
     vec2 uv = (gl_FragCoord.xy / u_resolution) - 0.5;
-    uv.x *= u_aspect;
+    uv.x *= u_aspect; // Keep the fractal square even when the screen is wide
 
     vec2 c = vec2(
         uv.x * u_zoom.x + u_center.x,
@@ -99,11 +105,12 @@ void main() {
     //    val = log(val + 1.0); // log brightness scale
     //}
 
-    float scaled = val * u_colorScale;
+    float scaled = val * u_colorScale + u_paletteOffset;
     gl_FragColor = vec4(palette(scaled),1.0);
 }
 `;
 
+// Compile a shader stage and log GLSL errors in the console.
 function compileShader(gl, type, source) {
     const s = gl.createShader(type);
     gl.shaderSource(s, source);
@@ -113,6 +120,7 @@ function compileShader(gl, type, source) {
     return s;
 }
 
+// Link vertex + fragment shaders into a WebGL program.
 function createProgram(gl, vs, fs) {
     const p = gl.createProgram();
     gl.attachShader(p, vs);
@@ -123,12 +131,14 @@ function createProgram(gl, vs, fs) {
     return p;
 }
 
+// Entry point: initializes WebGL, wires up UI, and starts the render loop.
 function main() {
-    const canvas = document.getElementById("glcanvas");
-    const overlay = document.getElementById("overlay");
+    const canvas = document.getElementById("glcanvas"); // WebGL render surface
+    const overlay = document.getElementById("overlay"); // 2D overlay for drag UI
     const gl = canvas.getContext("webgl");
     const ctx = overlay.getContext("2d");
 
+    // Match canvas pixel sizes to the CSS-stretched viewport.
     canvas.width = canvas.clientWidth;
     canvas.height = canvas.clientHeight;
     overlay.width = canvas.width;
@@ -140,6 +150,7 @@ function main() {
     const prog = createProgram(gl, vs, fs);
     gl.useProgram(prog);
 
+    // Cache attribute/uniform locations to avoid repeated lookups per frame.
     const aPos    = gl.getAttribLocation(prog, "a_position");
     const uCenter = gl.getUniformLocation(prog, "u_center");
     const uZoom   = gl.getUniformLocation(prog, "u_zoom");
@@ -148,62 +159,86 @@ function main() {
     const uMaxIter = gl.getUniformLocation(prog, "u_maxIter");
     const uColorScale = gl.getUniformLocation(prog, "u_colorScale");
     const uSmoothColor = gl.getUniformLocation(prog, "u_smoothColor");
+    const uPaletteOffset = gl.getUniformLocation(prog, "u_paletteOffset");
     //const uLogScale = gl.getUniformLocation(prog, "u_logScale");
 
-    const fractalAspect = 0.9;
     const screenAspect = canvas.width / canvas.height;
+    const fractalAspect = 0.9; // Desired complex-plane width/height ratio
 
     let zoomY = 2.5;
     let zoomX = zoomY * fractalAspect;
-    let currentCenter = { x:-0.375, y:0.0 };
+    let currentCenter = { x:-0.375, y:0.0 }; // Start near the Seahorse Valley
     let currentZoom   = { x: zoomX,  y: zoomY };
 
     const initialArea = zoomX * zoomY;
-    let currentMaxIter = 50;
+    let currentMaxIter = 50; // Iteration count grows as the selected area shrinks
 
-    let smooth = false;
+    let smooth = false; // Keyboard toggle for fractional iteration coloring
     //let logscale = false;
 
-    gl.uniform1f(uAspect, screenAspect / fractalAspect);
-    gl.uniform2f(uRes, canvas.width, canvas.height);
+    gl.uniform2f(uRes, canvas.width, canvas.height); // Resolution sent once (until resize support is added)
+
+    const getAspectCorrection = () => screenAspect * (currentZoom.y / currentZoom.x);
+    const palettePeriod = 14.0; // Matches palette size in the fragment shader
+    const paletteCycleRate = 2.0; // Palette indices per second
+    let paletteOffset = 0.0;
+    let lastFrameTime = 0;
 
     const buffer = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
         -1,-1, 1,-1, -1,1,
         1,-1, 1,1, -1,1
-    ]), gl.STATIC_DRAW);
+    ]), gl.STATIC_DRAW); // Two triangles covering clip space
     gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
     gl.enableVertexAttribArray(aPos);
 
-    function updateUniformsAndRedraw(){
+    function updateFractalUniforms(){
+        const aspectCorrection = getAspectCorrection();
         const area = currentZoom.x * currentZoom.y;
         let colorScale = Math.sqrt(area / initialArea);
-        colorScale = Math.max(colorScale, 0.05);
+        colorScale = Math.max(colorScale, 0.05); // Prevent colors from going flat at deep zooms
 
+        // Adjust shader parameters to reflect the latest zoom/center.
+        gl.uniform1f(uAspect, aspectCorrection);
         gl.uniform2f(uCenter, currentCenter.x, currentCenter.y);
         gl.uniform2f(uZoom, currentZoom.x, currentZoom.y);
         gl.uniform1i(uMaxIter, currentMaxIter);
         gl.uniform1f(uColorScale, colorScale);
         gl.uniform1i(uSmoothColor, smooth ? 1 : 0);
         //gl.uniform1i(uLogScale, logscale ? 1 : 0);
-
-        gl.drawArrays(gl.TRIANGLES, 0, 6);
     }
 
-    updateUniformsAndRedraw();
+    updateFractalUniforms();
+
+    function renderFrame(time){
+        if(lastFrameTime === 0) lastFrameTime = time;
+        const deltaSeconds = (time - lastFrameTime) / 1000;
+        lastFrameTime = time;
+
+        paletteOffset = (paletteOffset + deltaSeconds * paletteCycleRate) % palettePeriod;
+        if(paletteOffset < 0) paletteOffset += palettePeriod;
+
+        gl.uniform1f(uPaletteOffset, paletteOffset);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+        requestAnimationFrame(renderFrame);
+    }
+
+    requestAnimationFrame(renderFrame);
 
     // --- Keyboard toggles ---
     document.addEventListener("keydown", e=>{
         if(e.key === "s") smooth = !smooth;
         //if(e.key === "l") logscale = !logscale;
-        updateUniformsAndRedraw();
+        updateFractalUniforms();
     });
 
-    // --- Rectangle selection unchanged ---
+    // --- Rectangle selection for zooming ---
     let dragging = false;
     let start = {x:0,y:0};
     let curr = {x:0,y:0};
+    // Record drag start position in overlay space.
     overlay.addEventListener("pointerdown", e=>{
         dragging = true;
         const r = overlay.getBoundingClientRect();
@@ -212,6 +247,7 @@ function main() {
         curr = {...start};
     });
 
+    // Update rectangle preview while dragging.
     overlay.addEventListener("pointermove", e=>{
         if(!dragging) return;
         const r = overlay.getBoundingClientRect();
@@ -220,12 +256,12 @@ function main() {
         drawRect();
     });
 
+    // Finish the selection when the pointer is released or leaves the canvas.
     overlay.addEventListener("pointerup", clearRect);
     overlay.addEventListener("pointerleave", clearRect);
 
-    const fractAspect = 0.9;
-
     function drawRect(){
+        // Render the drag rectangle preview, snapping to the current view aspect ratio.
         ctx.clearRect(0,0,overlay.width,overlay.height);
         let dx = curr.x - start.x;
         let dy = curr.y - start.y;
@@ -233,14 +269,15 @@ function main() {
 
         const adx = Math.abs(dx);
         const ady = Math.abs(dy);
+        const targetAspect = currentZoom.x / currentZoom.y;
 
         let width, height;
-        if(adx / Math.max(ady,1e-6) > fractAspect){
+        if(adx / Math.max(ady,1e-6) > targetAspect){
             width = dx;
-            height = Math.sign(dy||1) * (adx/fractalAspect);
+            height = Math.sign(dy||1) * (adx/targetAspect);
         } else {
             height = dy;
-            width = Math.sign(dx||1) * (ady*fractAspect);
+            width = Math.sign(dx||1) * (ady*targetAspect);
         }
 
         let x = start.x, y = start.y;
@@ -260,15 +297,16 @@ function main() {
         if(x2<x1)[x1,x2]=[x2,x1];
         if(y2<y1)[y1,y2]=[y2,y1];
         ctx.clearRect(0,0,overlay.width,overlay.height);
-        if(x2-x1<4||y2-y1<4)return;
+        if(x2-x1<4||y2-y1<4)return; // Ignore tiny clicks (treated as taps)
         applyZoomFromRect(x1,y1,x2,y2);
     }
 
     function applyZoomFromRect(x1,y1,x2,y2){
+        // Translate overlay pixel coordinates into complex plane bounds.
         function pixelToComplex(px,py){
             const uvx=(px/overlay.width)-0.5;
             const uvy=0.5-(py/overlay.height);
-            const uvx2=uvx*(screenAspect/fractalAspect);
+            const uvx2=uvx*getAspectCorrection();
             return {
                 x: uvx2*currentZoom.x + currentCenter.x,
                 y: uvy*currentZoom.y + currentCenter.y
@@ -291,7 +329,7 @@ function main() {
         const scale=Math.sqrt(initialArea/area);
         currentMaxIter=Math.min(2000,Math.max(50,Math.floor(50*scale)));
 
-        updateUniformsAndRedraw();
+        updateFractalUniforms();
     }
 }
 
